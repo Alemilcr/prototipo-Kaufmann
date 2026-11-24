@@ -89,15 +89,83 @@ def tarjetas(res):
 """
 
 
+NOMBRE_ZONA = {
+    'EST-MB-1': 'Estantería Mercedes · piso 1', 'EST-MB-2': 'Estantería Mercedes · piso 2',
+    'EST-MB-3': 'Estantería Mercedes · piso 3', 'EST-OM-1': 'Estantería otras marcas · piso 1',
+    'EST-OM-2': 'Estantería otras marcas · piso 2', 'EST-OM-3': 'Estantería otras marcas · piso 3',
+    'RACK-BAJO': 'Rack bajo (nivel 1–2)', 'RACK-ALTO': 'Rack alto (nivel 3 o más)', 'OTRA': 'Otra (patio, búnker, jaula)',
+}
+CLASE_TXT = {'A': 'Muy vendido', 'B': 'Venta media', 'C': 'Poca venta'}
+PRIO_TXT = {'Alta': '🔴 Alta', 'Media': '🟡 Media', 'Baja': '🟢 Baja'}
+
+
+def zona_txt(z):
+    return NOMBRE_ZONA.get(z, z)
+
+
+def ubicaciones_recomendadas(d):
+    """Ubicación exacta recomendada para cada repuesto (misma regla del motor): dentro de cada zona,
+    los repuestos que se mueven toman las ubicaciones libres y el más vendido se queda con la más cercana."""
+    ubic = d.ubic.copy()
+    for z, grupo in d.groupby('zona_v2'):
+        if z == 'OTRA':
+            continue
+        fijos = grupo[~grupo.movible]
+        pool = d[d.zona_actual == z].drop(fijos.index, errors='ignore').sort_values('seg_ubic')
+        movs = grupo[grupo.movible].sort_values('pickings_12m', ascending=False)
+        k = min(len(pool), len(movs))
+        ubic.loc[movs.index[:k]] = pool.ubic.values[:k]
+        ubic.loc[movs.index[k:]] = 'Espacio por definir'
+    return ubic
+
+
+def recomendaciones(res):
+    """Tabla 'antes → después' lista para leer en bodega."""
+    if 'reco' in res:
+        return res['reco']
+    d = res['d']
+    d['ubic_v2'] = ubicaciones_recomendadas(d)
+    l = d.loc[res['lista'].index]
+    l = l.assign(prioridad=res['lista'].prioridad, seguridad=res['lista'].motivo.str.startswith('Seguridad'))
+    acerca = l.seg_v2 < l.seg_ubic
+    motivo = [('🦺 Pesado en rack alto: bajarlo por seguridad' if s else
+               f"{CLASE_TXT[c]} ({c}): {'acercarlo a la entrega' if a else 'liberar espacio cercano para los más vendidos'}")
+              for s, c, a in zip(l.seguridad, l.clase, acerca)]
+    reco = pd.DataFrame({
+        'Prioridad': l.prioridad.map(PRIO_TXT),
+        'Código': l.material,
+        'Repuesto': l.texto.str.strip().str.title(),
+        'Hoy está en': l.ubic.fillna('—') + '  ·  ' + l.zona_actual.map(zona_txt),
+        'Moverlo a': l.ubic_v2 + '  ·  ' + l.zona_v2.map(zona_txt),
+        'Motivo': motivo,
+        'Tiempo por picking': [f'{a:.0f} s → {b:.0f} s' for a, b in zip(l.seg_ubic, l.seg_v2)],
+        'Pedidos al año': l.pickings_12m.astype(int),
+    })
+    res['reco'] = reco
+    return reco
+
+
+def tabla_escenarios_txt(res):
+    """Tabla de escenarios con números en formato chileno."""
+    t = res['tabla'].copy()
+    for c in t.columns[1:]:
+        dec = 0 if ('Segundos' in c or 'Horas' in c) else 1
+        t[c] = t[c].map(lambda v: cl(v, dec) + (' %' if '(%)' in c else ''))
+    t.columns = [c.replace(' (%)', '') for c in t.columns]
+    return t
+
+
 def tabla_tiempos(res):
-    d = res['d']; pk = d[d.pickings_12m > 0]
+    d = res['d']
     filas = []
     for z in ZONAS:
         g = d[d.zona_actual == z]
         if g.empty:
             continue
-        filas.append({'Zona': z, 'SKU': len(g), 'Promedio (s)': round(g.seg_ubic.mean()),
-                      'Más cerca (s)': round(g.seg_ubic.min()), 'Más lejos (s)': round(g.seg_ubic.max())})
+        filas.append({'Zona': zona_txt(z), 'Repuestos': cl(len(g), 0),
+                      'Tiempo promedio': f'{g.seg_ubic.mean():.0f} s',
+                      'Ubicación más cercana': f'{g.seg_ubic.min():.0f} s',
+                      'Ubicación más lejana': f'{g.seg_ubic.max():.0f} s'})
     return pd.DataFrame(filas)
 
 
@@ -146,10 +214,11 @@ st.markdown("""<div class="hero"><span class="tag">Prototipo · Alternativa 1A �
   <p>Clasificación ABC con machine learning (K-means) y propuesta de reubicación de repuestos,
   calculada con datos reales de SAP y el layout de la bodega.</p>
   <div class="steps"><div class="step"><b>1</b>Suba los 3 Excel</div><div class="step"><b>2</b>Presione Calcular</div>
-  <div class="step"><b>3</b>Revise escenarios, reubicaciones y busque repuestos</div></div></div>""",
+  <div class="step"><b>3</b>Revise los escenarios y las recomendaciones de ubicación</div></div></div>""",
             unsafe_allow_html=True)
 
-tab1, tab2, tab3, tab4 = st.tabs(['① Cargar y calcular', '② Escenarios', '③ Reubicaciones', '④ Buscar repuesto'])
+tab1, tab2, tab3, tab4 = st.tabs(['① Cargar y calcular', '② Escenarios', '③ Recomendaciones de ubicación',
+                                  '④ Buscar repuesto'])
 
 with tab1:
     demo = os.environ.get('SLOTTING_DEMO')   # solo para pruebas locales
@@ -201,28 +270,51 @@ with tab2:
         st.info(aviso)
     else:
         st.subheader('Comparación de escenarios')
-        st.dataframe(res['tabla'], hide_index=True, width='stretch')
+        st.dataframe(tabla_escenarios_txt(res), hide_index=True, width='stretch')
         g1, g2 = st.columns(2)
         g1.pyplot(grafico_kpi(res))
         g2.pyplot(grafico_zonas(res))
-        st.subheader('Tiempo calculado por zona (segundos, ida y vuelta)')
+        st.subheader('Tiempo de ida y vuelta por zona (hoy)')
         st.dataframe(tabla_tiempos(res), hide_index=True, width='stretch')
 
 with tab3:
     if not res:
         st.info(aviso)
     else:
-        lista = res['lista']
-        cA, cB = st.columns([3, 1])
-        prio = cA.multiselect('Filtrar por prioridad', ['Alta', 'Media', 'Baja'], default=['Alta', 'Media', 'Baja'])
-        cB.download_button('⬇️ Descargar Excel completo', res['excel_bytes'],
-                           file_name='lista_reubicaciones_slotting.xlsx', width='stretch')
-        st.dataframe(lista[lista.prioridad.isin(prio)], hide_index=True, width='stretch', height=520)
+        reco = recomendaciones(res)
+        st.markdown('Cada fila es una recomendación: **saque el repuesto de "Hoy está en" y llévelo a "Moverlo a"**. '
+                    'Parta por las de prioridad 🔴 Alta (los más vendidos y los pesados en altura).')
+        cA, cB, cC = st.columns([2, 2, 1])
+        q3 = cA.text_input('Buscar', placeholder='Código o nombre del repuesto…', key='q3')
+        prio = cB.segmented_control('Prioridad', list(PRIO_TXT.values()), selection_mode='multi',
+                                    default=list(PRIO_TXT.values()), key='prio3')
+        cC.download_button('⬇️ Excel completo', res['excel_bytes'], file_name='lista_reubicaciones_slotting.xlsx',
+                           width='stretch')
+        v = reco[reco.Prioridad.isin(prio or [])]
+        if q3.strip():
+            v = v[v['Código'].str.contains(q3, case=False, na=False, regex=False) |
+                  v.Repuesto.str.contains(q3, case=False, na=False, regex=False)]
+        st.caption(f'Mostrando {cl(len(v), 0)} de {cl(len(reco), 0)} recomendaciones')
+        st.dataframe(v, hide_index=True, width='stretch', height=520, column_config={
+            'Prioridad': st.column_config.TextColumn(width='small'),
+            'Código': st.column_config.TextColumn(width='small'),
+            'Hoy está en': st.column_config.TextColumn(help='Ubicación actual (código PPEE-MMNN · zona)'),
+            'Moverlo a': st.column_config.TextColumn(help='Ubicación recomendada (código PPEE-MMNN · zona)'),
+            'Tiempo por picking': st.column_config.TextColumn(width='small',
+                                                              help='Ida y vuelta a la entrega: hoy → recomendada'),
+            'Pedidos al año': st.column_config.NumberColumn(width='small', help='Pickings de los últimos 12 meses'),
+        })
+        with st.expander('¿Cómo leer el código de ubicación (PPEE-MMNN)?'):
+            st.markdown('- **PP = piso**: 10, 20 y 30 son los pisos 1 a 3 de la estantería; 40 o más son racks.\n'
+                        '- **EE = estantería**: la 01 está junto al mostrador; de la 04 a la 08 son Mercedes-Benz.\n'
+                        '- **MM = módulo**: el 01 está en la pared izquierda.\n'
+                        '- **NN = nivel**: en estantería el 01 es el de arriba; en rack el 01 es el de abajo.')
 
 with tab4:
     if not res:
         st.info(aviso)
     else:
+        recomendaciones(res)   # calcula la ubicación recomendada de cada repuesto
         q = st.text_input('Código de material o descripción', placeholder='Ej: filtro, A0004771302…')
         if q.strip():
             d = res['d']
@@ -231,11 +323,15 @@ with tab4:
             if m.empty:
                 st.warning(f'No encontré repuestos con «{q}».')
             else:
-                m = m.assign(zona_propuesta=m.zona_v2.where(m.zona_v2 != m.zona_actual, 'se queda'))
-                st.dataframe(m[['material', 'texto', 'clase', 'ubic', 'zona_actual', 'zona_propuesta']]
-                             .rename(columns={'texto': 'descripción', 'ubic': 'ubicación hoy',
-                                              'zona_actual': 'zona hoy', 'zona_propuesta': 'zona propuesta'}),
-                             hide_index=True, width='stretch')
+                mueve = m.movible & (m.zona_v2 != m.zona_actual)
+                st.dataframe(pd.DataFrame({
+                    'Código': m.material,
+                    'Repuesto': m.texto.str.strip().str.title(),
+                    'Venta': m.clase.map(lambda c: f'{CLASE_TXT[c]} ({c})'),
+                    'Hoy está en': m.ubic.fillna('—') + '  ·  ' + m.zona_actual.map(zona_txt),
+                    'Recomendación': [f'Moverlo a {u}  ·  {zona_txt(z)}' if mv else '✅ Se queda donde está'
+                                      for u, z, mv in zip(m.ubic_v2, m.zona_v2, mueve)],
+                }), hide_index=True, width='stretch')
 
 st.markdown('<div class="pie">Prototipo académico · Proyecto Integrado, Técnico en Logística INACAP · '
             'Los datos se procesan en la sesión y no se guardan.</div>', unsafe_allow_html=True)
